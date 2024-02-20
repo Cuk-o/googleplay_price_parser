@@ -195,7 +195,7 @@ def handle_message(update: Update, context: CallbackContext) -> None:
 
 def main():
     # Токен вашего бота
-    TOKEN = '5541722708:AAGBYrKDTF9DqyBhxI-l5K4azjCKlr-pNEg'
+    TOKEN = 'telegram_bot_token'
 
     updater = Updater(TOKEN)
 
