@@ -1,5 +1,6 @@
 from telegram import Update, ForceReply, ParseMode
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+import config
 import logging
 import csv
 import re
@@ -75,6 +76,7 @@ countries = ["DZ", "AU", "BH", "BD", "BO", "BR", "CA", "KY", "CL", "CO", "CR",
             "RU", "SA", "RS", "SG", "ZA", "LK", "TW", "TZ", "TH", "TR", "UA", "AE", "US", "VN"]
 
 
+
 currency_rates = {
     "DZD": 134.55, "AUD": 1.53, "BHD": 0.376, "BDT": 109.73, "BOB": 6.91,
     "BRL": 4.97,  "CAD": 1.35, "KYD": 0.833, "CLP": 970.01,
@@ -141,19 +143,41 @@ def setup_driver():
     chrome_options.add_argument("--headless")
     chrome_options.add_argument("--log-level=3")
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument(f"user-data-dir={config.CONST_PROFILE_PATH}")
+    prefs = {
+        "profile.managed_default_content_settings.images": 2,  # Блокировка изображений
+        "profile.managed_default_content_settings.stylesheets": 2,  # Блокировка CSS
+        "profile.managed_default_content_settings.cookies": 2,  # Блокировка cookies (опционально)
+        "profile.managed_default_content_settings.javascript": 2,  # Разрешение JavaScript
+        "profile.managed_default_content_settings.plugins": 2,  # Блокировка плагинов (Flash, Silverlight)
+        "profile.managed_default_content_settings.popups": 2,  # Блокировка всплывающих окон
+        "profile.managed_default_content_settings.geolocation": 2,  # Блокировка геолокации
+        "profile.managed_default_content_settings.notifications": 2,  # Блокировка уведомлений
+        "profile.managed_default_content_settings.media_stream": 2,  # Блокировка медиа потоков
+        "profile.default_content_setting_values.automatic_downloads": 2  # Блокировка автоматических загрузок
+    }
+    chrome_options.add_experimental_option("prefs", prefs)
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=chrome_options)
     return driver
 
 # Команда start
 def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text('Привет! Отправь мне идентификатор приложения на Google Play, например com.habby.archero')
+    update.message.reply_text('Привет! Поделись ссылкой из Google Play для определения идентификатора приложения')
 
 # Обработка текстовых сообщений
 
 def handle_message(update: Update, context: CallbackContext) -> None:
+    start = time.time()
     app_id = update.message.text
-    directory_path = "/root/googleplay"  # Укажите ваш путь к директории для сохранения файлов
+    match = re.search(r'id=(\w+\.[\w\d_\.]+)', app_id)
+    if match:
+        app_id = match.group(1)
+    else:
+        update.message.reply_text('Не удалось найти идентификатор приложения. Пожалуйста, отправьте корректный URL.')
+        return
+    directory_path = config.CONST_PATH  # Укажите ваш путь к директории для сохранения файлов
     filename = f"{app_id}.csv"
     filepath = os.path.join(directory_path, filename)
 
@@ -173,8 +197,6 @@ def handle_message(update: Update, context: CallbackContext) -> None:
         file_size = os.path.getsize(filepath)
         if file_size == 1939:
             context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text='У этого приложения нет внутриигровых покупок.')
-
-            #update.message.reply_text('У этого приложения нет внутриигровых покупок.')
             return
         elif file_size < 1939:
             os.remove(filepath)  # Удаляем файл
@@ -192,64 +214,83 @@ def handle_message(update: Update, context: CallbackContext) -> None:
    
     driver = setup_driver()
     try:
+        collected_data = []  # Временный список для хранения данных
+
+        for country_code in countries:
+            processed_countries += 1
+            percent_done = (processed_countries / countries_total) * 100
+            text = f'Прогресс: {percent_done:.2f}%'
+            context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text=text)
+            
+            # Задержка, чтобы избежать чрезмерного количества запросов
+            time.sleep(0.5)
+            prices, currency_code = get_prices_for_country(driver, country_code, country_currency_dict, app_id)
+            converted_prices_text = []
+            if prices:
+                for price_str in prices:
+                    price_values = re.findall(r'\d[\d,.]*', price_str)
+                    for value in price_values:
+                        if country_code == 'ID':
+                            value = value.replace(",", ".")
+                            value = value.replace(".", "")
+                        else:    
+                            value = value.replace(",", "")
+                        converted_price = convert_price_to_usd(value, currency_code)
+                        converted_prices_text.append(f"{converted_price} USD")
+            else:
+                converted_prices_text = ["No price information found"]
+            
+            # Сохраняем данные для каждой страны
+            collected_data.append([country_code, currency_code, '; '.join(prices), '; '.join(converted_prices_text)])
+            
+        data = []
+        for item in collected_data:
+            country_code, currency, price_range, usd_range = item
+            max_usd_price = float(usd_range.split(';')[-1].strip().split(' ')[0])
+            data.append({
+                "country_code": country_code,
+                "currency": currency,
+                "price_range": price_range,
+                "usd_range": usd_range,
+                "max_usd_price": max_usd_price
+            })
+
+        # Сортируем собранные данные по максимальной цене в USD
+        sorted_data = sorted(data, key=lambda x: x["max_usd_price"])
+        
+
+        # Запись отсортированных данных в файл
         with open(filepath, mode='w', newline='', encoding='utf-8') as file:
             writer = csv.writer(file)
             writer.writerow(['Country', 'Currency', 'Original Price Range', 'Converted Price Range (USD)'])
-            #update.message.reply_text('Среднее время ответа 2 минуты')
-            for country_code in countries:
-                processed_countries += 1
-                percent_done = (processed_countries / countries_total) * 100
-                text = f'Прогресс: {percent_done:.2f}%'
-                context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text=text)
-                
-                # Задержка, чтобы избежать чрезмерного количества запросов
-                time.sleep(0.5)
-                prices, currency_code = get_prices_for_country(driver, country_code, country_currency_dict, app_id)
-                converted_prices_text = []
-                if prices:
-                    for price_str in prices:
-                        price_values = re.findall(r'\d[\d,.]*', price_str)
-                        for value in price_values:
-                            if country_code == 'ID':
-                                value = value.replace(",", ".")
-                                value = value.replace(".", "")
-                            else:    
-                                value = value.replace(",", "")
-                            converted_price = convert_price_to_usd(value, currency_code)
-                            converted_prices_text.append(f"{converted_price} USD")
-                else:
-                    converted_prices_text = ["No price information found"]
+            for item in sorted_data:
+                #writer.writerow(item)
+                writer.writerow([item["country_code"], item["currency"], item["price_range"], item["usd_range"]])
 
-                writer.writerow([country_code, currency_code, '; '.join(prices), '; '.join(converted_prices_text)])
 
-        #update.message.reply_text('Обработка завершена, отправляю файл...')
+        # Отправляем файл
         with open(filepath, 'rb') as file:
             update.message.reply_document(document=file)
+
     finally:
         context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text="Обработка завершена.")
+        end = time.time()
+        print(end - start)
+
         driver.quit()
-        
+
+def extract_max_price(usd_range_str):
+    """Извлекает максимальную цену в USD из строки, обрабатывая возможные ошибки."""
+    try:
+        return float(usd_range_str.split(';')[-1].split(' ')[0])
+    except ValueError:
+        return float('inf')  # Присваиваем "бесконечность" для некорректных или отсутствующих значений        
 
 # Дополните этот код своими функциями setup_driver, convert_price_to_usd и get_prices_for_country
 
-
-def process_and_create_file(update: Update, context: CallbackContext, app_id: str, filepath: str):
-    driver = setup_driver()
-    try:
-        with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Country', 'Currency', 'Original Price Range', 'Converted Price Range (USD)'])
-            # Здесь продолжается логика обработки, как в исходном примере...
-        
-        # После создания файла, отправляем его
-        update.message.reply_text('Обработка завершена, отправляю файл...')
-        update.message.reply_document(document=open(filepath, 'rb'))
-    finally:
-        driver.quit()
-
 def main():
     # Токен вашего бота
-    TOKEN = ''
+    TOKEN = config.CONST_TOKEN
 
     updater = Updater(TOKEN)
 
@@ -264,4 +305,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
