@@ -1,17 +1,13 @@
-from telegram import Update, ForceReply, ParseMode
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-import config
-import logging
-import csv
-import re
-import os
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+import nest_asyncio
 import time
-from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+import re
+import csv
+import os
+from telegram.ext import Application, CommandHandler, MessageHandler, filters
+import aiohttp
+import asyncio
+import config
 
-   
 country_currency_dict = {
     "DZ": "DZD",
     "AU": "AUD",
@@ -69,13 +65,10 @@ country_currency_dict = {
     "VN": "VND",
 }
 
-
 countries = ["DZ", "AU", "BH", "BD", "BO", "BR", "CA", "KY", "CL", "CO", "CR", 
             "SV", "GE", "GH", "HK", "IN", "ID", "IQ", "IL", "JP", "JO", "KZ", "KE", "KR", 
             "KW", "MO", "MY", "MX", "MA", "MM", "NZ", "NG", "OM", "PK", "PY", "PE", "PH", "QA", 
             "RU", "SA", "RS", "SG", "ZA", "LK", "TW", "TZ", "TH", "TR", "UA", "AE", "US", "VN"]
-
-
 
 currency_rates = {
     "DZD": 134.55, "AUD": 1.53, "BHD": 0.376, "BDT": 109.73, "BOB": 6.91,
@@ -91,219 +84,121 @@ currency_rates = {
     "AED": 3.67, "USD": 1, "VND": 24526.38
 }
 
-
-# Настройка логирования
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-def convert_price_to_usd(price_str, currency_code):
+async def convert_price_to_usd(price_str, currency_code):
     price_match = re.search(r"(\d[\d,.]*)", price_str.replace(",", ""))
     if price_match:
         price = float(price_match.group(1).replace(",", ""))
-        rate = currency_rates.get(currency_code.upper(), 1)  # По умолчанию 1, если валюта не найдена
+        rate = currency_rates.get(currency_code.upper(), 1)
         if currency_code == 'IDR':
-            return round(price / rate / 100, 2)
-        else:    
-            return round(price / rate, 2)  # Конвертация в USD и округление
+            return round(price / rate * 1000, 2)
+        else:
+            return round(price / rate, 2)
     return 0
 
-def get_prices_for_country(driver, country_code, country_currency_dict, app_id):
-   
-    # Получаем код валюты для страны, по умолчанию USD
+async def fetch_page(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            return await response.text()
+
+async def get_prices_for_country(country_code, app_id):
     currency_code = country_currency_dict.get(country_code, "USD")
-    
-    # Формируем URL для доступа к странице приложения в Google Play
-    url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en_US&gl={country_code}'
-    
-    # Открываем страницу приложения
-    driver.get(url)
+    url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en&gl={country_code}'
+    page_content = await fetch_page(url)
     print(country_code)
-    # Ждем 2 секунды, чтобы страница полностью загрузилась
-    time.sleep(1)
-    
-    # Прокручиваем страницу до конца
-    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    
-    # Ждем 1 секунду после прокрутки
-    time.sleep(1)
-    
-    # Получаем исходный код страницы
-    page_source = driver.page_source
-    
-    # Используем регулярное выражение для поиска цен
-    regex_pattern = r'"([^"]*?\sper\sitem)",'
-    matches = re.findall(regex_pattern, page_source)
-    
-    return matches, currency_code
+    # Проверка наличия текста "In-app purchases"
+    if country_code == 'DZ':
+        if "In-app purchases" not in page_content:
+            print("На странице нет текста 'In-app purchases'")
+            return None, currency_code, 'noinapp'
+        if "We're sorry, the requested URL was not found on this server." in page_content:
+            print("404")
+            return None, currency_code, '404'
 
+    # Извлечение информации о ценах с помощью регулярных выражений
+    matches = re.findall(r'"([^"]*?\sper\sitem)",', page_content)
+    return matches, currency_code, True
 
-# Функции для работы с WebDriver
-def setup_driver():
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--log-level=3")
-    chrome_options.add_argument("--no-sandbox")
-    chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument(f"user-data-dir={config.CONST_PROFILE_PATH}")
-    prefs = {
-        "profile.managed_default_content_settings.images": 2,  # Блокировка изображений
-        "profile.managed_default_content_settings.stylesheets": 2,  # Блокировка CSS
-        "profile.managed_default_content_settings.cookies": 2,  # Блокировка cookies (опционально)
-        "profile.managed_default_content_settings.javascript": 2,  # Разрешение JavaScript
-        "profile.managed_default_content_settings.plugins": 2,  # Блокировка плагинов (Flash, Silverlight)
-        "profile.managed_default_content_settings.popups": 2,  # Блокировка всплывающих окон
-        "profile.managed_default_content_settings.geolocation": 2,  # Блокировка геолокации
-        "profile.managed_default_content_settings.notifications": 2,  # Блокировка уведомлений
-        "profile.managed_default_content_settings.media_stream": 2,  # Блокировка медиа потоков
-        "profile.default_content_setting_values.automatic_downloads": 2  # Блокировка автоматических загрузок
-    }
-    chrome_options.add_experimental_option("prefs", prefs)
-    service = Service(ChromeDriverManager().install())
-    driver = webdriver.Chrome(service=service, options=chrome_options)
-    return driver
+async def fetch_prices(update, context, app_id):
+    tasks = [get_prices_for_country(country_code, app_id) for country_code in countries]
+    results = await asyncio.gather(*tasks)
 
-# Команда start
-def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text('Привет! Поделись ссылкой из Google Play для определения идентификатора приложения')
+    await update.message.reply_text('Обработка началась.')
 
-# Обработка текстовых сообщений
+    collected_data = []
+    processed_countries = 0
+    
+    for result in results:
+        prices, currency_code, success = result
+        processed_countries += 1
+        country_code = countries[processed_countries - 1]  # Получаем код страны из списка
+        if success and prices:
+            converted_prices_text = [str(await convert_price_to_usd(price, currency_code)) for price in prices]
+            collected_data.append([country_code, currency_code, '; '.join(prices), '; '.join([f"{price} USD" for price in converted_prices_text])])
+        elif success in ["noinapp", "404"]:
+            print(f"{country_code}: Нет данных о покупках в приложении или страница не найдена.")
+        else:
+            print(f"{country_code}: Данные не найдены.")
+            continue
 
-def handle_message(update: Update, context: CallbackContext) -> None:
-    start = time.time()
-    app_id = update.message.text
-    match = re.search(r'id=(\w+\.[\w\d_\.]+)', app_id)
+#        converted_prices_text = [await convert_price_to_usd(price, currency_code) for price in prices]
+ #       collected_data.append([country_code, currency_code, '; '.join(prices), '; '.join([f"{price} USD" for price in converted_prices_text])])
+
+    # Сортировка списка по конвертированной цене в USD (4-й элемент списка, индекс 3)
+    sorted_data = sorted(collected_data, key=lambda x: x[3])
+
+    # Сохранение отсортированных данных в файл CSV
+    filepath = os.path.join(config.CONST_PATH, f"{app_id}.csv")
+    with open(filepath, mode='w', newline='', encoding='utf-8') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Country', 'Currency', 'Original Price Range', 'Converted Price Range (USD)', 'Currency Label'])
+        for item in sorted_data:
+            writer.writerow(item)
+    
+    return filepath
+
+async def start(update, context):
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="Привет! Поделись ссылкой из Google Play для определения идентификатора приложения.")
+
+async def handle_message(update, context):
+    start_time = time.time()  # Запоминаем время начала обработки
+    text = update.message.text
+    match = re.search(r'id=(\w+\.[\w\d_\.]+)', text)
+    
     if match:
         app_id = match.group(1)
-    else:
-        update.message.reply_text('Не удалось найти идентификатор приложения. Пожалуйста, отправьте корректный URL.')
-        return
-    directory_path = config.CONST_PATH  # Укажите ваш путь к директории для сохранения файлов
-    filename = f"{app_id}.csv"
-    filepath = os.path.join(directory_path, filename)
-
-
-    progress_message = update.message.reply_text('Обработка началась. Прогресс: 0%')
-    progress_message_id = progress_message.message_id
-    progress_chat_id = progress_message.chat_id
-
-    driver = setup_driver()
-    processed_countries = 0
-    countries_total = len(countries)
-
-
-
-    # Проверка на существование файла и его размер
-    if os.path.exists(filepath):
-        file_size = os.path.getsize(filepath)
-        if file_size == 1939:
-            context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text='У этого приложения нет внутриигровых покупок.')
-            return
-        elif file_size < 1939:
-            os.remove(filepath)  # Удаляем файл
-            #update.message.reply_text('Провожу повторную проверку...')
-            # Здесь код для повторной генерации файла или получения данных
-        else:
-            context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text="Обработка завершена.")
-
-            #update.message.reply_text('Файл уже существует, отправляю сохраненный файл...')
-            with open(filepath, 'rb') as file:
-                update.message.reply_document(document=file)
-            return
-
-    # Если файла нет или он был удален из-за малого размера, начинаем процесс создания файла
-   
-    driver = setup_driver()
-    try:
-        collected_data = []  # Временный список для хранения данных
-
-        for country_code in countries:
-            processed_countries += 1
-            percent_done = (processed_countries / countries_total) * 100
-            text = f'Прогресс: {percent_done:.2f}%'
-            context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text=text)
-            
-            # Задержка, чтобы избежать чрезмерного количества запросов
-            time.sleep(0.5)
-            prices, currency_code = get_prices_for_country(driver, country_code, country_currency_dict, app_id)
-            converted_prices_text = []
-            if prices:
-                for price_str in prices:
-                    price_values = re.findall(r'\d[\d,.]*', price_str)
-                    for value in price_values:
-                        if country_code == 'ID':
-                            value = value.replace(",", ".")
-                            value = value.replace(".", "")
-                        else:    
-                            value = value.replace(",", "")
-                        converted_price = convert_price_to_usd(value, currency_code)
-                        converted_prices_text.append(f"{converted_price} USD")
-            else:
-                converted_prices_text = ["No price information found"]
-            
-            # Сохраняем данные для каждой страны
-            collected_data.append([country_code, currency_code, '; '.join(prices), '; '.join(converted_prices_text)])
-            
-        data = []
-        for item in collected_data:
-            country_code, currency, price_range, usd_range = item
-            max_usd_price = float(usd_range.split(';')[-1].strip().split(' ')[0])
-            data.append({
-                "country_code": country_code,
-                "currency": currency,
-                "price_range": price_range,
-                "usd_range": usd_range,
-                "max_usd_price": max_usd_price
-            })
-
-        # Сортируем собранные данные по максимальной цене в USD
-        sorted_data = sorted(data, key=lambda x: x["max_usd_price"])
+        # Формируем предполагаемый путь к файлу
+        filepath = os.path.join(config.CONST_PATH, f"{app_id}.csv")
         
+        # Проверяем, существует ли файл
+        if os.path.exists(filepath):
+            # Если файл существует, отправляем его без повторной проверки цен
+            print("Отправка существующего файла.")
+            with open(filepath, 'rb') as file:
+                await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
+        else:
+            # Если файла нет, запускаем процесс сбора данных и создания файла
+            filepath = await fetch_prices(update, context, app_id)
+            
+            if filepath is not None:
+                with open(filepath, 'rb') as file:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
+            else:
+                await context.bot.send_message(chat_id=update.effective_chat.id, text=f'Информация о ценах для приложения {app_id} не найдена или страница приложения отсутствует.')
+        
+        end_time = time.time()  # Запоминаем время окончания обработки
+        total_time = end_time - start_time  # Вычисляем общее время выполнения
+        print(f"Время выполнения: {total_time:.2f} секунд.")
+    else:
+        await context.bot.send_message(chat_id=update.effective_chat.id, text="Не удалось найти идентификатор приложения. Пожалуйста, отправьте корректный URL.")
 
-        # Запись отсортированных данных в файл
-        with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-            writer = csv.writer(file)
-            writer.writerow(['Country', 'Currency', 'Original Price Range', 'Converted Price Range (USD)'])
-            for item in sorted_data:
-                #writer.writerow(item)
-                writer.writerow([item["country_code"], item["currency"], item["price_range"], item["usd_range"]])
+async def main():
+    application = Application.builder().token(config.CONST_TOKEN).build()
 
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-        # Отправляем файл
-        with open(filepath, 'rb') as file:
-            update.message.reply_document(document=file)
-
-    finally:
-        context.bot.edit_message_text(chat_id=progress_chat_id, message_id=progress_message_id, text="Обработка завершена.")
-        end = time.time()
-        print(end - start)
-
-        driver.quit()
-
-def extract_max_price(usd_range_str):
-    """Извлекает максимальную цену в USD из строки, обрабатывая возможные ошибки."""
-    try:
-        return float(usd_range_str.split(';')[-1].split(' ')[0])
-    except ValueError:
-        return float('inf')  # Присваиваем "бесконечность" для некорректных или отсутствующих значений        
-
-# Дополните этот код своими функциями setup_driver, convert_price_to_usd и get_prices_for_country
-
-def main():
-    # Токен вашего бота
-    TOKEN = config.CONST_TOKEN
-
-    updater = Updater(TOKEN)
-
-    # Регистрация обработчиков команд
-    dispatcher = updater.dispatcher
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-    # Запуск бота
-    updater.start_polling()
-    updater.idle()
+    await application.run_polling()
 
 if __name__ == '__main__':
-    main()
-
-
+    nest_asyncio.apply()
+    asyncio.run(main())
