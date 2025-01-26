@@ -106,6 +106,7 @@ def create_currency_parsers():
        'CAD': lambda x: float(clean(x).replace('$', '')),
        'SGD': lambda x: float(clean(x).replace('$', '')),
        'ILS': lambda x: float(clean(x).replace('₪', '').replace(',', '')),
+       'ZAR': lambda x: float(clean(x).replace('R ', '').replace(' ', '').replace(',', '.')),
        'DEFAULT': lambda x: float(re.search(r'[\d,.]+', clean(x)).group(0).replace(',', ''))
    }
 
