@@ -65,7 +65,7 @@ country_currency_dict = {
     "VN": "VND",
 }
 
-countries = ["DZ", "AU", "BD", "BO", "BR", "CA", "CL", "CO", "CR", 
+countries = ["DZ", "EG", "AU", "BD", "BO", "BR", "CA", "CL", "CO", "CR", 
             "GE", "GH", "HK", "IN", "ID", "IQ", "IL", "JP", "JO", "KZ", "KE", "KR", 
             "MO", "MY", "MX", "MA", "MM", "NZ", "NG", "PK", "PY", "PE", "PH", "QA", 
             "RU", "SA", "RS", "SG", "ZA", "LK", "TW", "TZ", "TH", "TR", "UA", "AE", "US", "VN"]
@@ -133,60 +133,65 @@ async def fetch_page(url):
             return await response.text()
 
 async def get_prices_for_country(country_code, app_id):
-    currency_code = country_currency_dict.get(country_code, "USD")
-    url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en&gl={country_code}'
-    page_content = await fetch_page(url)
-    print(country_code)
-    # Проверка наличия текста "In-app purchases"
-    
-    if "In-app purchases" not in page_content:
-        print("На странице нет текста 'In-app purchases'")
-        return None, currency_code, 'noinapp'
-    if "We're sorry, the requested URL was not found on this server." in page_content:
-        print("404")
-        return None, currency_code, '404'
-
-    # Извлечение информации о ценах с помощью регулярных выражений
-    matches = re.findall(r'"([^"]*?\sper\sitem)",', page_content)
-    return matches, currency_code, True
+    try:
+        currency_code = country_currency_dict.get(country_code, "USD")
+        url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en&gl={country_code}'
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                page_content = await response.text()
+                print(country_code)
+                
+                if "In-app purchases" not in page_content:
+                    print("На странице нет текста 'In-app purchases'")
+                    return None, currency_code, 'noinapp'
+                if "We're sorry, the requested URL was not found on this server." in page_content:
+                    print("404")
+                    return None, currency_code, '404'
+                
+                matches = re.findall(r'"([^"]*?\sper\sitem)",', page_content)
+                del page_content  # Clear memory
+                return matches, currency_code, True
+                
+    except Exception as e:
+        print(f"Error for {country_code}: {e}")
+        return None, currency_code, False
     
 
 async def fetch_prices(update, context, app_id):
-    tasks = [get_prices_for_country(country_code, app_id) for country_code in countries]
-    results = await asyncio.gather(*tasks)
-    
     await update.message.reply_text('Обработка началась.')
-
     collected_data = []
-    processed_countries = 0
+    batch_size = 5
     
-    for result in results:
-        prices, currency_code, success = result
-        processed_countries += 1
-        country_code = countries[processed_countries - 1]  # Получаем код страны из списка
-        if success and prices:
-            converted_prices = [await convert_price_to_usd(price, currency_code) for price in prices]
-            # Вычисляем минимальную и максимальную цену среди всех конвертированных для текущей страны
-            min_converted_price = min(min_price for min_price, _ in converted_prices)
-            max_converted_price = max(max_price for _, max_price in converted_prices)
-            collected_data.append([country_code, currency_code, '; '.join(prices), str(min_converted_price), str(max_converted_price)])
-        elif success in ["404"]:
-            print(f"{country_code}: Нет данных о покупках в приложении или страница не найдена.")
-            return
-        else:
-            print(f"{country_code}: Данные не найдены.")
-            continue
+    for i in range(0, len(countries), batch_size):
+        batch = countries[i:i+batch_size]
+        tasks = [get_prices_for_country(country_code, app_id) for country_code in batch]
+        batch_results = await asyncio.gather(*tasks)
+        
+        for j, result in enumerate(batch_results):
+            prices, currency_code, success = result
+            country_code = batch[j]
+            
+            if success and prices:
+                converted_prices = [await convert_price_to_usd(price, currency_code) for price in prices]
+                min_converted_price = min(min_price for min_price, _ in converted_prices)
+                max_converted_price = max(max_price for _, max_price in converted_prices)
+                collected_data.append([country_code, currency_code, '; '.join(prices), 
+                                    str(min_converted_price), str(max_converted_price)])
+            elif success == "404":
+                print(f"{country_code}: Нет данных о покупках в приложении или страница не найдена.")
+                return
+            else:
+                print(f"{country_code}: Данные не найдены.")
 
-    # Сортировка списка по минимальной конвертированной цене в USD
     sorted_data = sorted(collected_data, key=lambda x: float(x[4]))
-
-    # Сохранение отсортированных данных в файл CSV
     filepath = os.path.join(config.CONST_PATH, f"{app_id}.csv")
+    
     with open(filepath, mode='w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        writer.writerow(['Country', 'Currency', 'Original Price Range', 'Converted Price Min (USD)', 'Converted Price Max (USD)'])
-        for item in sorted_data:
-            writer.writerow(item)
+        writer.writerow(['Country', 'Currency', 'Original Price Range', 
+                        'Converted Price Min (USD)', 'Converted Price Max (USD)'])
+        writer.writerows(sorted_data)
     
     return filepath
 
@@ -245,5 +250,4 @@ async def main():
 if __name__ == '__main__':
     nest_asyncio.apply()
     asyncio.run(main())
-
 
