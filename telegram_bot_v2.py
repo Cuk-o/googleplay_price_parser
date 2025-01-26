@@ -87,43 +87,47 @@ currency_rates = {
 }
 
 
+def create_currency_parsers():
+   clean = lambda x: x.replace(' per item', '').replace('\xa0', ' ').strip()
+   
+   return {
+       'IDR': lambda x: float(clean(x).replace('Rp ', '').replace('.', '').replace(',00', '')),
+       'JOD': lambda x: float(clean(x).replace('JOD ', '').replace('.000', '')),
+       'TRY': lambda x: float(clean(x).replace('TRY ', '').replace(',', '')),
+       'JPY': lambda x: float(clean(x).replace('¥', '').replace(',', '')),
+       'KRW': lambda x: float(clean(x).replace('₩', '').replace(',', '')),
+       'INR': lambda x: float(clean(x).replace('₹', '').replace(',', '')),
+       'VND': lambda x: float(clean(x).replace('₫', '').replace(',', '')),
+       'HKD': lambda x: float(clean(x).replace('HK$', '').replace(',', '')),
+       'TWD': lambda x: float(clean(x).replace('NT$', '').replace(',', '')),
+       'USD': lambda x: float(clean(x).replace('$', '')),
+       'AUD': lambda x: float(clean(x).replace('$', '')),
+       'NZD': lambda x: float(clean(x).replace('$', '')),
+       'CAD': lambda x: float(clean(x).replace('$', '')),
+       'SGD': lambda x: float(clean(x).replace('$', '')),
+       'ILS': lambda x: float(clean(x).replace('₪', '').replace(',', '')),
+       'DEFAULT': lambda x: float(re.search(r'[\d,.]+', clean(x)).group(0).replace(',', ''))
+   }
+
 async def convert_price_to_usd(price_str, currency_code):
-    price_parts = price_str.split('-')
-    converted_prices = []
-
-    for part in price_parts:
-        # Обработка каждой части диапазона цен
-        price_match = re.search(r"(\d[\d,.]*)", part)
-        if price_match:
-            price_str = price_match.group(1)
-
-            # Удаление разделителей тысяч и десятичных знаков
-            last_dot_position = max(price_str.rfind('.'), price_str.rfind(','))
-            if last_dot_position != -1 and len(price_str) - last_dot_position - 1 == 2:
-                price_str = price_str[:last_dot_position]
-            price_str = price_str.replace(",", "").replace(".", "")
-
-            # Преобразование в число
-            price = float(price_str)
-            if currency_code == 'JOD':
-                price = price / 1000
-
-            # Получение курса валюты и конвертация
-            rate = currency_rates.get(currency_code.upper(), 1)
-            converted_price = round(price / rate, 2)
-            converted_prices.append(converted_price)
-        else:
-            # Если не удалось преобразовать, добавляем 0
-            converted_prices.append(0)
-
-    if len(converted_prices) == 2:
-        # Возвращаем минимальную и максимальную цены, если есть диапазон
-        return converted_prices[0], converted_prices[1]
-    elif len(converted_prices) == 1:
-        # Возвращаем одну цену как минимальную и максимальную, если диапазона нет
-        return converted_prices[0], converted_prices[0]
-    else:
-        # В случае отсутствия цен, возвращаем 0, 0
+    try:
+        first_range = price_str.split(';')[0].strip()
+        min_price_str, max_price_str = [p.strip() for p in first_range.split('-')]
+        
+        parsers = create_currency_parsers()
+        parser = parsers.get(currency_code, parsers['DEFAULT'])
+        
+        min_price = parser(min_price_str)
+        max_price = parser(max_price_str)
+        
+        rate = currency_rates.get(currency_code, 1)
+        return (
+            max(round(min_price / rate, 2), 0.01),
+            max(round(max_price / rate, 2), 0.01)
+        )
+    except Exception as e:
+        print(f"Error parsing {currency_code}: {price_str}")
+        print(f"Error: {e}")
         return 0, 0
 
 
@@ -159,41 +163,38 @@ async def get_prices_for_country(country_code, app_id):
     
 
 async def fetch_prices(update, context, app_id):
-    await update.message.reply_text('Обработка началась.')
-    collected_data = []
-    batch_size = 5
-    
-    for i in range(0, len(countries), batch_size):
-        batch = countries[i:i+batch_size]
-        tasks = [get_prices_for_country(country_code, app_id) for country_code in batch]
-        batch_results = await asyncio.gather(*tasks)
-        
-        for j, result in enumerate(batch_results):
-            prices, currency_code, success = result
-            country_code = batch[j]
-            
-            if success and prices:
-                converted_prices = [await convert_price_to_usd(price, currency_code) for price in prices]
-                min_converted_price = min(min_price for min_price, _ in converted_prices)
-                max_converted_price = max(max_price for _, max_price in converted_prices)
-                collected_data.append([country_code, currency_code, '; '.join(prices), 
-                                    str(min_converted_price), str(max_converted_price)])
-            elif success == "404":
-                print(f"{country_code}: Нет данных о покупках в приложении или страница не найдена.")
-                return
-            else:
-                print(f"{country_code}: Данные не найдены.")
+   await update.message.reply_text('Обработка началась.')
+   collected_data = []
+   batch_size = 5
+   
+   for i in range(0, len(countries), batch_size):
+       batch = countries[i:i+batch_size]
+       tasks = [get_prices_for_country(country_code, app_id) for country_code in batch]
+       batch_results = await asyncio.gather(*tasks)
+       
+       for j, result in enumerate(batch_results):
+           prices, currency_code, success = result
+           country_code = batch[j]
+           
+           if success and prices:
+               min_price, max_price = await convert_price_to_usd(prices[0], currency_code)
+               collected_data.append([min_price, max_price, country_code, 
+                                   currency_code, prices[0]])
+           elif success == "404":
+               print(f"{country_code}: Нет данных")
+               return
+           else:
+               print(f"{country_code}: Данные не найдены")
 
-    sorted_data = sorted(collected_data, key=lambda x: float(x[4]))
-    filepath = os.path.join(config.CONST_PATH, f"{app_id}.csv")
-    
-    with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['Country', 'Currency', 'Original Price Range', 
-                        'Converted Price Min (USD)', 'Converted Price Max (USD)'])
-        writer.writerows(sorted_data)
-    
-    return filepath
+   sorted_data = sorted(collected_data, key=lambda x: float(x[0]))
+   filepath = os.path.join(config.CONST_PATH, f"{app_id}.csv")
+   
+   with open(filepath, mode='w', newline='', encoding='utf-8') as file:
+       writer = csv.writer(file)
+       writer.writerow(['Min Price (USD)', 'Max Price (USD)', 'Country', 'Currency', 'Original Price Range'])
+       writer.writerows(sorted_data)
+   
+   return filepath
 
 
 
