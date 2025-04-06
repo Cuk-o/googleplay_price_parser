@@ -19,7 +19,7 @@ import config
 
 country_currency_dict = {
     "DZ": "DZD", "AU": "AUD", "BH": "BHD", "BD": "BDT", "BO": "BOB", "BR": "BRL",
-    "KH": "KHR", "CA": "CAD", "KY": "KYD", "CL": "CLP", "CO": "COP", "CR": "CRC",
+    "KH": "KHR", "CA": "CAD", "KYD": "KYD", "CL": "CLP", "CO": "COP", "CR": "CRC",
     "EG": "EGP", "GE": "GEL", "GH": "GHS", "HK": "HKD", "IN": "INR", "ID": "IDR",
     "IQ": "IQD", "IL": "ILS", "JP": "JPY", "JO": "JOD", "KZ": "KZT", "KE": "KES",
     "KR": "KRW", "KW": "KWD", "MO": "MOP", "MY": "MYR", "MX": "MXN", "MA": "MAD",
@@ -29,7 +29,7 @@ country_currency_dict = {
     "TH": "THB", "TR": "TRY", "UA": "UAH", "AE": "AED", "US": "USD", "VN": "VND",
 }
 
-# Cписок стран, по которым делаем парсинг:
+# Список стран, по которым делаем парсинг:
 countries = [
     "DZ","EG","AU","BD","BO","BR","CA","CL","CO","CR","GE","GH","HK","IN","ID","IQ",
     "IL","JP","JO","KZ","KE","KR","MO","MY","MX","MA","MM","NZ","NG","PK","PY","PE",
@@ -114,27 +114,32 @@ async def get_prices_for_country_google(country_code, app_id):
     Вызывается для каждой страны.
     Загружает страницу Google Play и ищет текст: "XXX per item"
     Возвращает (список_найденных_цен, currency_code, статус).
+    Добавлены таймауты и обработка таймаутов.
     """
+    currency_code = country_currency_dict.get(country_code, "USD")
+    url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en&gl={country_code}'
+    timeout = aiohttp.ClientTimeout(total=10)  # Таймаут в 10 секунд
+
     try:
-        currency_code = country_currency_dict.get(country_code, "USD")
-        url = f'https://play.google.com/store/apps/details?id={app_id}&hl=en&gl={country_code}'
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            try:
+                async with session.get(url) as response:
+                    page_content = await response.text()
+                    print(f"[Google] {country_code}")
 
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                page_content = await response.text()
-                print(f"[Google] {country_code}")
+                    if "In-app purchases" not in page_content:
+                        print("На странице нет текста 'In-app purchases'")
+                        return None, currency_code, 'noinapp'
+                    if "We're sorry, the requested URL was not found on this server." in page_content:
+                        print("404")
+                        return None, currency_code, '404'
 
-                if "In-app purchases" not in page_content:
-                    print("На странице нет текста 'In-app purchases'")
-                    return None, currency_code, 'noinapp'
-                if "We're sorry, the requested URL was not found on this server." in page_content:
-                    print("404")
-                    return None, currency_code, '404'
-
-                # Ищем шаблон, например, "XXX per item"
-                matches = re.findall(r'"([^"]*?\sper\sitem)",', page_content)
-                return matches, currency_code, True
-
+                    # Ищем шаблон, например, "XXX per item"
+                    matches = re.findall(r'"([^"]*?\sper\sitem)",', page_content)
+                    return matches, currency_code, True
+            except asyncio.TimeoutError:
+                print(f"[Google] {country_code}: Таймаут запроса.")
+                return None, currency_code, 'timeout'
     except Exception as e:
         print(f"Error for {country_code}: {e}")
         return None, None, False
@@ -145,7 +150,7 @@ async def fetch_prices_google(update, context, app_id):
     """
     await update.message.reply_text('Обработка для Google Play началась...')
     collected_data = []
-    batch_size = 5  # разом обрабатываем по 5 стран (можно менять)
+    batch_size = 5  # разом обрабатываем по 5 стран
 
     for i in range(0, len(countries), batch_size):
         batch = countries[i:i+batch_size]
@@ -157,7 +162,6 @@ async def fetch_prices_google(update, context, app_id):
             country_code = batch[j]
 
             if success is True and prices:
-                # Берём первую найденную цену/диапазон
                 min_price_usd, max_price_usd = await convert_price_to_usd_google(prices[0], currency_code)
                 collected_data.append([
                     min_price_usd,
@@ -168,18 +172,22 @@ async def fetch_prices_google(update, context, app_id):
                 ])
             elif success == '404':
                 print(f"{country_code}: Страница не найдена (404).")
+            elif success == 'timeout':
+                print(f"{country_code}: Превышено время ожидания запроса.")
             else:
-                # либо 'noinapp', либо ошибка
                 print(f"{country_code}: Данные не найдены.")
 
     # Сортируем по Min Price
     sorted_data = sorted(collected_data, key=lambda x: float(x[0]))
     filepath = os.path.join(config.CONST_PATH, f"{app_id}_google.csv")
 
-    with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(['Min Price (USD)', 'Max Price (USD)', 'Country', 'Currency', 'Original Price Range'])
-        writer.writerows(sorted_data)
+    try:
+        with open(filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow(['Min Price (USD)', 'Max Price (USD)', 'Country', 'Currency', 'Original Price Range'])
+            writer.writerows(sorted_data)
+    except Exception as e:
+        print(f"Ошибка записи CSV: {e}")
 
     return filepath
 
@@ -188,10 +196,9 @@ async def fetch_prices_google(update, context, app_id):
 def extract_numeric_price(price_str: str):
     """
     Извлекает число из строки вида '￦29,000' -> 29000, '$19.99' -> 19.99, etc.
-    Убираем все не-цифры (кроме . и ,), затем удаляем запятые.
     """
-    clean_str = re.sub(r'[^\d.,]+', '', price_str)  # оставим только цифры, точки, запятые
-    clean_str = clean_str.replace(',', '')          # убираем запятые
+    clean_str = re.sub(r'[^\d.,]+', '', price_str)
+    clean_str = clean_str.replace(',', '')
     if not clean_str:
         return 0.0
     try:
@@ -199,24 +206,21 @@ def extract_numeric_price(price_str: str):
     except:
         return 0.0
 
-# Словарь для перевода арабских цифр в обычные
 arabic_digits_map = {
     '٠': '0', '١': '1', '٢': '2', '٣': '3',
     '٤': '4', '٥': '5', '٦': '6', '٧': '7',
     '٨': '8', '٩': '9'
 }
 
-# Словарь конфигураций для каждой валюты
 currency_configs = {
     "DZD": {
-        "strip_strings": ["‏US", "US$"],  # Удаляем оба варианта префикса
+        "strip_strings": ["‏US", "US$"],
         "arabic_digits_map": None,
         "arabic_decimal_dot": None,
         "thousands_sep": None,
-        "decimal_sep": ",",        # Используем запятую как десятичный разделитель
-        "is_already_usd": True     # Важно! Указываем что это уже в USD
+        "decimal_sep": ",",
+        "is_already_usd": True
     },
-
     "BRL": {
         "strip_strings": ["R$"],
         "arabic_digits_map": None,
@@ -225,26 +229,22 @@ currency_configs = {
         "decimal_sep": ",",
         "is_already_usd": False
     },
-
-    # --- Египет (арабские цифры) ---
     "EGP": {
-        "strip_strings": ["ج.م.‏"],  # что вырезать
+        "strip_strings": ["ج.م.‏"],
         "arabic_digits_map": arabic_digits_map,
-        "arabic_decimal_dot": "٫",   # заменить на "."
-        "thousands_sep": None,       # нет явного (или игнорируем)
-        "decimal_sep": None,         # допустим, нет
+        "arabic_decimal_dot": "٫",
+        "thousands_sep": None,
+        "decimal_sep": None,
         "is_already_usd": False
     },
-    # --- Колумбия ---
     "COP": {
-        "strip_strings": [],         # ничего особого
+        "strip_strings": [],
         "arabic_digits_map": None,
         "arabic_decimal_dot": None,
-        "thousands_sep": ".",        # точка - разделитель тысяч
-        "decimal_sep": ",",          # запятая - дробная
+        "thousands_sep": ".",
+        "decimal_sep": ",",
         "is_already_usd": False
     },
-    # --- Чили ---
     "CLP": {
         "strip_strings": [],
         "arabic_digits_map": None,
@@ -253,7 +253,6 @@ currency_configs = {
         "decimal_sep": ",",
         "is_already_usd": False
     },
-    # --- США (цены в USD) ---
     "USD": {
         "strip_strings": [],
         "arabic_digits_map": None,
@@ -262,8 +261,6 @@ currency_configs = {
         "decimal_sep": None,
         "is_already_usd": True
     },
-    # Можно добавить BRL, EUR, INR и пр. по аналогии.
-    # --- Значение по умолчанию ---
     "DEFAULT": {
         "strip_strings": [],
         "arabic_digits_map": None,
@@ -276,62 +273,47 @@ currency_configs = {
 
 async def convert_price_to_usd_apple(price_str: str, currency_code: str):
     """
-    Универсальный парсер, использующий для каждой валюты (CLP, COP, EGP и т.д.)
-    собственные настройки. Возвращает (price_usd, price_usd).
+    Универсальный парсер для каждой валюты.
     """
-
     try:
-        # 1) Если в самой строке встречается "USD", считаем 1:1
         if 'USD' in price_str.upper() or 'DZD' in price_str.upper():
             numeric_part = re.sub(r'[^0-9.,]+', '', price_str)
             numeric_part = numeric_part.replace(',', '')
             price_usd = float(numeric_part) if numeric_part else 0.0
             return (price_usd, price_usd)
 
-        # 2) Берем конфиг для конкретной валюты, либо DEFAULT
-        config = currency_configs.get(currency_code, currency_configs["DEFAULT"])
+        cfg = currency_configs.get(currency_code, currency_configs["DEFAULT"])
 
-        # 2.1) Вырезаем указанные подстроки (например, "ج.م.‏")
-        for s in config["strip_strings"]:
+        for s in cfg["strip_strings"]:
             price_str = price_str.replace(s, "")
 
-        # 2.2) Если нужно заменить арабские цифры
-        if config["arabic_digits_map"]:
-            # Если есть arabic_decimal_dot, меняем на "."
-            if config["arabic_decimal_dot"]:
-                price_str = price_str.replace(config["arabic_decimal_dot"], ".")
-            # Переводим цифры
+        if cfg["arabic_digits_map"]:
+            if cfg["arabic_decimal_dot"]:
+                price_str = price_str.replace(cfg["arabic_decimal_dot"], ".")
             converted = []
             for ch in price_str:
-                if ch in config["arabic_digits_map"]:
-                    converted.append(config["arabic_digits_map"][ch])
+                if ch in cfg["arabic_digits_map"]:
+                    converted.append(cfg["arabic_digits_map"][ch])
                 else:
                     converted.append(ch)
             price_str = ''.join(converted)
 
-        # 2.3) Удаляем всё, кроме цифр, точек и запятых
         clean_str = re.sub(r'[^0-9.,]+', '', price_str)
 
-        # 2.4) Удаляем разделитель тысяч
-        if config["thousands_sep"]:
-            clean_str = clean_str.replace(config["thousands_sep"], '')
+        if cfg["thousands_sep"]:
+            clean_str = clean_str.replace(cfg["thousands_sep"], '')
 
-        # 2.5) Заменяем разделитель дробей на точку (например, ',' -> '.')
-        if config["decimal_sep"] and config["decimal_sep"] != '.':
-            clean_str = clean_str.replace(config["decimal_sep"], '.')
+        if cfg["decimal_sep"] and cfg["decimal_sep"] != '.':
+            clean_str = clean_str.replace(cfg["decimal_sep"], '.')
 
-        # 3) Превращаем результат в число
         numeric_price = float(clean_str) if clean_str else 0.0
 
-        # 4) Если в конфиге указано is_already_usd=True, ничего не делим
-        if config["is_already_usd"]:
+        if cfg["is_already_usd"]:
             price_usd = numeric_price
         else:
-            # Ищем курс, если нет — считаем 1.0
             rate = currency_rates.get(currency_code, 1.0)
             price_usd = numeric_price / rate
 
-        # 5) Округляем и возвращаем
         price_usd = max(round(price_usd, 2), 0.01)
         return (price_usd, price_usd)
 
@@ -342,39 +324,27 @@ async def convert_price_to_usd_apple(price_str: str, currency_code: str):
 
 async def get_prices_for_country_apple(country_code, apple_id):
     """
-    Запрашивает JSON-данные: https://app.sensortower.com/api/ios/apps/<apple_id>?country=<country_code>
-    Ищет блок top_in_app_purchases -> [ {iap...}, ... ].
-    Возвращает список словарей с полями:
-    {
-      "name": <название iap>,
-      "price_str": <ориг. цена, напр. "￦29,000">,
-      "currency_code": <код валюты>,
-      "duration": <строка, напр. "P1M">,
-      "min_price_usd": <число>,
-      "max_price_usd": <число>
-    }
-    Или None, если данных нет.
+    Запрашивает JSON-данные с Sensor Tower API.
+    Добавлены таймауты и обработка таймаутов.
     """
     url = f"https://app.sensortower.com/api/ios/apps/{apple_id}?country={country_code}"
     currency_code = country_currency_dict.get(country_code, "USD")
+    timeout = aiohttp.ClientTimeout(total=10)  # Таймаут в 10 секунд
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         try:
             async with session.get(url) as response:
                 if response.status == 404:
-                    print(f"[Apple] {country_code}: 404 for {url}")
+                    print(f"[Apple] {country_code}: 404 для {url}")
                     return None
 
                 text = await response.text()
-
-                # Парсим JSON
                 data = json.loads(text)
 
                 if "top_in_app_purchases" not in data:
                     print(f"[Apple] {country_code}: Нет top_in_app_purchases")
                     return None
 
-                # top_in_app_purchases: {"KR": [ {iap...}, ...], "US": [...], ...}
                 iaps_for_country = data["top_in_app_purchases"].get(country_code)
                 if not iaps_for_country:
                     print(f"[Apple] {country_code}: Нет IAP для страны.")
@@ -397,11 +367,12 @@ async def get_prices_for_country_apple(country_code, apple_id):
                         "max_price_usd": max_price_usd
                     })
                 return results
-
+        except asyncio.TimeoutError:
+            print(f"[Apple] {country_code}: Таймаут запроса для {url}")
+            return None
         except Exception as e:
             print(f"[Apple] {country_code} Error: {e}")
             return None
-
 
 async def fetch_prices_apple(update, context, apple_id):
     """
@@ -410,7 +381,6 @@ async def fetch_prices_apple(update, context, apple_id):
     await update.message.reply_text("Обработка для App Store (JSON API) началась...")
     collected_data = []
     
-    # Проверяем только для EGP (Египет)
     country_code = "EG"
     
     try:
@@ -434,22 +404,23 @@ async def fetch_prices_apple(update, context, apple_id):
     except Exception as e:
         print(f"[Apple] {country_code} Error: {e}")
 
-    # Сортируем по min_price_usd
     sorted_data = sorted(collected_data, key=lambda x: float(x[0]))
-
     filepath = os.path.join(config.CONST_PATH, f"{apple_id}_apple_EGP.csv")
-    with open(filepath, mode='w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow([
-            'Min Price (USD)',
-            'Max Price (USD)',
-            'Country',
-            'Currency',
-            'Original Price',
-            'IAP Name',
-            'Duration'
-        ])
-        writer.writerows(sorted_data)
+    try:
+        with open(filepath, mode='w', newline='', encoding='utf-8') as file:
+            writer = csv.writer(file)
+            writer.writerow([
+                'Min Price (USD)',
+                'Max Price (USD)',
+                'Country',
+                'Currency',
+                'Original Price',
+                'IAP Name',
+                'Duration'
+            ])
+            writer.writerows(sorted_data)
+    except Exception as e:
+        print(f"Ошибка записи CSV для Apple: {e}")
 
     return filepath
 
@@ -467,83 +438,89 @@ async def start(update, context):
 
 async def handle_message(update, context):
     start_time = time.time()
-    text = update.message.text
+    try:
+        text = update.message.text
 
-    user = update.effective_user
-    username = user.username if user.username else "неизвестный"
-    full_name = f"{user.first_name} {user.last_name if user.last_name else ''}".strip()
+        user = update.effective_user
+        username = user.username if user.username else "неизвестный"
+        full_name = f"{user.first_name} {user.last_name if user.last_name else ''}".strip()
 
-    # Определяем, Google Play или App Store
-    if "play.google.com" in text:
-        # Ищем ?id=com.example
-        match = re.search(r'id=([\w\d\.]+)', text)
-        if not match:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Не удалось найти идентификатор приложения в Google Play ссылке."
-            )
-            return
-        app_id = match.group(1)
-        filepath = await fetch_prices_google(update, context, app_id)
+        if "play.google.com" in text:
+            match = re.search(r'id=([\w\d\.]+)', text)
+            if not match:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Не удалось найти идентификатор приложения в Google Play ссылке."
+                )
+                return
+            app_id = match.group(1)
+            filepath = await fetch_prices_google(update, context, app_id)
 
-        if filepath and os.path.exists(filepath):
-            with open(filepath, 'rb') as file:
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
+            if filepath and os.path.exists(filepath):
+                with open(filepath, 'rb') as file:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"Информация о ценах для приложения {app_id} не найдена или страница недоступна."
+                )
+
+        elif "apps.apple.com" in text:
+            match = re.search(r'/id(\d+)', text)
+            if not match:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text="Не удалось найти идентификатор приложения (idNNN) в App Store ссылке."
+                )
+                return
+            apple_id = match.group(1)
+            filepath = await fetch_prices_apple(update, context, apple_id)
+
+            if filepath and os.path.exists(filepath):
+                with open(filepath, 'rb') as file:
+                    await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
+            else:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=f"Информация о ценах для приложения {apple_id} не найдена или страница недоступна."
+                )
+
         else:
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
-                text=f"Информация о ценах для приложения {app_id} не найдена или страница недоступна."
+                text="Ссылка не распознана. Отправьте ссылку на приложение Google Play или App Store."
             )
-
-    elif "apps.apple.com" in text:
-        # Ищем /idNNN
-        match = re.search(r'/id(\d+)', text)
-        if not match:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Не удалось найти идентификатор приложения (idNNN) в App Store ссылке."
-            )
-            return
-        apple_id = match.group(1)
-        filepath = await fetch_prices_apple(update, context, apple_id)
-
-        if filepath and os.path.exists(filepath):
-            with open(filepath, 'rb') as file:
-                await context.bot.send_document(chat_id=update.effective_chat.id, document=file)
-        else:
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text=f"Информация о ценах для приложения {apple_id} не найдена или страница недоступна."
-            )
-
-    else:
-        # Ни Google, ни Apple
+    except Exception as e:
+        print(f"Ошибка в обработке сообщения: {e}")
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
-            text="Ссылка не распознана. Отправьте ссылку на приложение Google Play или App Store."
+            text="Произошла ошибка при обработке вашего запроса."
         )
-
-    # Логирование
-    end_time = time.time()
-    total_time = end_time - start_time
-    print(f"Время выполнения: {total_time:.2f} секунд.")
-    print(f"Запрос от {full_name} (@{username})")
-
-    # Сохраняем в лог
-    logs_path = os.path.join(config.CONST_PATH, "logs.log")
-    with open(logs_path, mode='a', newline='', encoding='utf-8') as f:
-        writer = csv.writer(f)
-        current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
-        writer.writerow([
-            current_time,
-            f"Время: {total_time:.2f} сек, пользователь: {full_name} (@{username})"
-        ])
+    finally:
+        end_time = time.time()
+        total_time = end_time - start_time
+        print(f"Время выполнения: {total_time:.2f} секунд.")
+        print(f"Запрос от {full_name} (@{username})")
+        logs_path = os.path.join(config.CONST_PATH, "logs.log")
+        try:
+            with open(logs_path, mode='a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime())
+                writer.writerow([
+                    current_time,
+                    f"Время: {total_time:.2f} сек, пользователь: {full_name} (@{username})"
+                ])
+        except Exception as e:
+            print(f"Ошибка записи логов: {e}")
 
 async def main():
     application = ApplicationBuilder().token(config.CONST_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    await application.run_polling()
+    try:
+        await application.run_polling()
+    except Exception as e:
+        print(f"Ошибка в основном цикле бота: {e}")
 
 if __name__ == '__main__':
     nest_asyncio.apply()
