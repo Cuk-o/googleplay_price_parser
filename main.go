@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/csv"
+	// "encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -23,8 +24,9 @@ import (
 
 // Конфигурация
 const (
-	CONST_TOKEN = "enter_token" // Замените на ваш токен бота
-	CONST_PATH  = "./data"         // Путь для сохранения файлов
+	CONST_TOKEN       = "6993196254:AAG6Za3SDay3hNSrvneCGFlmg8vRn9W2PYs" // Замените на ваш токен бота
+	CONST_PATH        = "./data"         // Путь для сохранения файлов
+	CACHE_EXPIRY_HOURS = 24              // Срок действия кэша в часах
 )
 
 // Словарь для соответствия страны и валюты
@@ -49,19 +51,19 @@ var countries = []string{
 
 // Курсы валют к USD
 var currencyRates = map[string]float64{
-	"DZD": 134.966, "AUD": 1.583982, "BHD": 0.376241, "BDT": 109.73,
+	"DZD": 132.966, "AUD": 1.583982, "BHD": 0.376241, "BDT": 109.73,
 	"BOB": 6.909550, "BRL": 5.806974, "CAD": 1.433827, "KYD": 0.833,
-	"CLP": 961.794638, "COP": 4153.599492, "CRC": 504.817577, "EGP": 50.291311,
+	"CLP": 961.794638, "COP": 4153.599492, "CRC": 504.817577, "EGP": 50.581311,
 	"GEL": 2.867107, "GHS": 15.187930, "HKD": 7.787505, "INR": 86.249922,
 	"IDR": 16149.393463, "IQD": 1309.703222, "ILS": 3.587793, "JPY": 155.855438,
-	"JOD": 0.709118, "KZT": 519.503277, "KES": 129.264801, "KRW": 1432.185253,
+	"JOD": 0.709118, "KZT": 505.503277, "KES": 129.264801, "KRW": 1432.185253,
 	"KWD": 0.308060, "MOP": 8.021963, "MYR": 4.392292, "MXN": 20.245294,
 	"MAD": 10.007902, "MMK": 2099.980901, "NZD": 1.752597, "NGN": 1550.620034,
 	"OMR": 0.384454, "PKR": 278.655722, "PYG": 7918.619687, "PEN": 3.712514,
 	"PHP": 58.388686, "QAR": 3.639992, "RUB": 97.929483, "SAR": 3.750482,
 	"RSD": 112.125584, "SGD": 1.348339, "ZAR": 18.384263, "LKR": 298.761937,
 	"TWD": 32.687009, "TZS": 2507.601986, "THB": 33.712166, "TRY": 35.678472,
-	"UAH": 41.939132, "AED": 3.671703, "USD": 1, "VND": 25094.287781,
+	"UAH": 40.939132, "AED": 3.671703, "USD": 1, "VND": 25094.287781,
 }
 
 // Структура для хранения найденных цен
@@ -71,6 +73,169 @@ type PriceData struct {
 	CountryCode   string
 	CurrencyCode  string
 	OriginalPrice string
+}
+
+// Структура для кэша
+type CacheEntry struct {
+	Timestamp time.Time
+	filePath   string
+}
+
+// Кэш для хранения результатов
+var priceCache = make(map[string]CacheEntry)
+var cacheMutex sync.RWMutex
+
+// Структура для ограничения скорости запросов
+type RateLimiter struct {
+	rate       float64
+	per        float64
+	allowance  float64
+	lastUpdate time.Time
+	mu         sync.Mutex
+}
+
+// Создает новый ограничитель скорости
+func NewRateLimiter(rate, per float64) *RateLimiter {
+	return &RateLimiter{
+		rate:       rate,
+		per:        per,
+		allowance:  rate,
+		lastUpdate: time.Now(),
+	}
+}
+
+// Проверяет, можно ли выполнить запрос
+func (rl *RateLimiter) Allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	current := time.Now()
+	timePassed := current.Sub(rl.lastUpdate).Seconds()
+	rl.lastUpdate = current
+	
+	rl.allowance += timePassed * (rl.rate / rl.per)
+	if rl.allowance > rl.rate {
+		rl.allowance = rl.rate // предел
+	}
+	
+	if rl.allowance < 1.0 {
+		return false
+	}
+	
+	rl.allowance -= 1.0
+	return true
+}
+
+// Ожидает, пока можно будет выполнить запрос
+func (rl *RateLimiter) Wait() {
+	for {
+		rl.mu.Lock()
+		current := time.Now()
+		timePassed := current.Sub(rl.lastUpdate).Seconds()
+		rl.lastUpdate = current
+		
+		rl.allowance += timePassed * (rl.rate / rl.per)
+		if rl.allowance > rl.rate {
+			rl.allowance = rl.rate
+		}
+		
+		if rl.allowance < 1.0 {
+			waitTime := (1.0 - rl.allowance) * rl.per / rl.rate
+			rl.mu.Unlock()
+			time.Sleep(time.Duration(waitTime * float64(time.Second)))
+		} else {
+			rl.allowance -= 1.0
+			rl.mu.Unlock()
+			return
+		}
+	}
+}
+
+// Глобальный ограничитель скорости запросов
+var googleLimiter = NewRateLimiter(10.0, 1.0) // 10 запросов в секунду
+
+// Структура для хранения данных о запросах пользователей
+type UserRequestData struct {
+	RequestTimes []time.Time
+	mu           sync.Mutex
+}
+
+// Карта запросов пользователей для ограничения скорости
+var userRequests = make(map[int64]*UserRequestData)
+var userRequestsMu sync.Mutex
+
+// Проверяет, не превышен ли лимит запросов пользователя
+func checkUserRateLimit(userID int64, maxRequests int, periodSeconds int) bool {
+	userRequestsMu.Lock()
+	if _, exists := userRequests[userID]; !exists {
+		userRequests[userID] = &UserRequestData{
+			RequestTimes: []time.Time{},
+		}
+	}
+	data := userRequests[userID]
+	userRequestsMu.Unlock()
+	
+	data.mu.Lock()
+	defer data.mu.Unlock()
+	
+	now := time.Now()
+	cutoff := now.Add(-time.Duration(periodSeconds) * time.Second)
+	
+	// Очищаем старые запросы
+	newTimes := []time.Time{}
+	for _, t := range data.RequestTimes {
+		if t.After(cutoff) {
+			newTimes = append(newTimes, t)
+		}
+	}
+	data.RequestTimes = newTimes
+	
+	// Проверяем, не превышен ли лимит
+	if len(data.RequestTimes) >= maxRequests {
+		return false
+	}
+	
+	// Добавляем текущий запрос
+	data.RequestTimes = append(data.RequestTimes, now)
+	return true
+}
+
+// Функция для получения данных из кэша
+func getFromCache(appID string, storeType string) string {
+	cacheKey := fmt.Sprintf("%s_%s", appID, storeType)
+	
+	cacheMutex.RLock()
+	defer cacheMutex.RUnlock()
+	
+	if entry, exists := priceCache[cacheKey]; exists {
+		if time.Since(entry.Timestamp) < time.Duration(CACHE_EXPIRY_HOURS)*time.Hour && fileExists(entry.filePath ) {
+			log.Printf("Кэш-хит для %s", cacheKey)
+			return entry.filePath
+		}
+	}
+	
+	return ""
+}
+
+// Функция для сохранения данных в кэш
+func saveToCache(appID string, storeType string, filepath string) {
+	cacheKey := fmt.Sprintf("%s_%s", appID, storeType)
+	
+	cacheMutex.Lock()
+	defer cacheMutex.Unlock()
+	
+	priceCache[cacheKey] = CacheEntry{
+		Timestamp: time.Now(),
+		filePath:  filepath, // Исправлено: используем параметр функции
+	}
+	
+	log.Printf("Сохранено в кэш: %s", cacheKey)
+}
+
+// Проверяет, существует ли файл
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
 }
 
 // Функция для очистки строки цены
@@ -117,6 +282,8 @@ func parsePrice(priceStr string, currencyCode string) (float64, error) {
 	case "ZAR":
 		priceStr = strings.ReplaceAll(priceStr, "R ", "")
 		priceStr = strings.ReplaceAll(priceStr, " ", "")
+	case "COP":
+		priceStr = strings.ReplaceAll(priceStr, "COP ", "")
 	}
 	
 	// Удаляем специальные суффиксы
@@ -138,10 +305,22 @@ func parsePrice(priceStr string, currencyCode string) (float64, error) {
 	
 	// Определяем формат цены на основе анализа строки
 	if hasComma && hasDot {
-		// Случай, когда в строке есть и точки, и запятые (например, "1.234,56")
-		// Обычно точка - разделитель тысяч, запятая - десятичная
-		numStr = strings.ReplaceAll(matches, ".", "")
-		numStr = strings.ReplaceAll(numStr, ",", ".")
+		// Случай, когда в строке есть и точки, и запятые (например, "1,040,000.00")
+		dotIndex := strings.LastIndex(matches, ".")
+		commaIndex := strings.LastIndex(matches, ",")
+		
+		if dotIndex > commaIndex {
+			// Если последняя точка после последней запятой, 
+			// то точка - разделитель дробной части, а запятые - разделители тысяч
+			// (Формат: "1,234,567.89")
+			numStr = strings.ReplaceAll(matches, ",", "")
+		} else {
+			// Если последняя запятая после последней точки,
+			// то запятая - разделитель дробной части, а точки - разделители тысяч
+			// (Формат: "1.234.567,89")
+			numStr = strings.ReplaceAll(matches, ".", "")
+			numStr = strings.ReplaceAll(numStr, ",", ".")
+		}
 	} else if hasDot {
 		// Проверяем, является ли точка разделителем тысяч или десятичной точкой
 		parts := strings.Split(matches, ".")
@@ -275,6 +454,66 @@ func convertPriceToUSD(priceStr string, currencyCode string) (float64, float64, 
 	return minUSD, maxUSD, nil
 }
 
+// Функция для повторного выполнения HTTP-запроса с экспоненциальной задержкой
+func getWithRetry(url string, maxRetries int) (string, int, error) {
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+	}
+	
+	var content string
+	var statusCode int
+	var err error
+	
+	backoffFactor := 1.5
+	
+	for i := 0; i < maxRetries; i++ {
+		// Ожидаем разрешения от ограничителя скорости
+		googleLimiter.Wait()
+		
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Попытка %d из %d: ошибка запроса %s: %v", i+1, maxRetries, url, err)
+			if i == maxRetries-1 {
+				return "", 0, err
+			}
+			waitTime := time.Duration(backoffFactor * math.Pow(2, float64(i))) * time.Second
+			time.Sleep(waitTime)
+			continue
+		}
+		defer resp.Body.Close()
+		
+		statusCode = resp.StatusCode
+		if statusCode != http.StatusOK {
+			log.Printf("Попытка %d из %d: HTTP-статус %d для %s", i+1, maxRetries, statusCode, url)
+			if statusCode == http.StatusNotFound {
+				return "", http.StatusNotFound, nil
+			}
+			if i == maxRetries-1 {
+				return "", statusCode, fmt.Errorf("Не удалось получить успешный ответ после %d попыток", maxRetries)
+			}
+			waitTime := time.Duration(backoffFactor * math.Pow(2, float64(i))) * time.Second
+			time.Sleep(waitTime)
+			continue
+		}
+		
+		bodyBytes, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("Попытка %d из %d: ошибка чтения ответа для %s: %v", i+1, maxRetries, url, err)
+			if i == maxRetries-1 {
+				return "", statusCode, err
+			}
+			waitTime := time.Duration(backoffFactor * math.Pow(2, float64(i))) * time.Second
+			time.Sleep(waitTime)
+			continue
+		}
+		
+		content = string(bodyBytes)
+		return content, statusCode, nil
+	}
+	
+	return content, statusCode, err
+}
+
 // Функция для получения цен для конкретной страны
 func getPricesForCountry(countryCode string, appID string) ([]string, string, error) {
 	currencyCode, exists := countryCurrencyDict[countryCode]
@@ -284,56 +523,28 @@ func getPricesForCountry(countryCode string, appID string) ([]string, string, er
 	
 	url := fmt.Sprintf("https://play.google.com/store/apps/details?id=%s&hl=en&gl=%s", appID, countryCode)
 	
-	// Создаем транспорт с возможностью повторных попыток
-	client := &http.Client{
-		Timeout: 15 * time.Second, // Увеличиваем таймаут для медленных соединений
-	}
-	
-	// Делаем запрос с повторными попытками в случае неудачи
-	var resp *http.Response
-	var err error
-	maxRetries := 2
-	
-	for i := 0; i <= maxRetries; i++ {
-		resp, err = client.Get(url)
-		if err == nil {
-			break
-		}
-		
-		if i < maxRetries {
-			log.Printf("[Google] %s: Повторная попытка запроса (%d из %d) после ошибки: %v", 
-				countryCode, i+1, maxRetries, err)
-			time.Sleep(time.Duration(i+1) * time.Second)
-		}
-	}
-	
+	content, statusCode, err := getWithRetry(url, 3)
 	if err != nil {
-		return nil, currencyCode, fmt.Errorf("Ошибка запроса после %d попыток: %v", maxRetries+1, err)
-	}
-	defer resp.Body.Close()
-	
-	// Проверяем код ответа
-	if resp.StatusCode != http.StatusOK {
-		return nil, currencyCode, fmt.Errorf("Ошибка HTTP: %d", resp.StatusCode)
+		return nil, currencyCode, fmt.Errorf("Ошибка запроса после повторных попыток: %v", err)
 	}
 	
-	// Читаем содержимое страницы
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, currencyCode, fmt.Errorf("Ошибка чтения ответа: %v", err)
+	if statusCode == http.StatusNotFound {
+		return nil, currencyCode, fmt.Errorf("404")
 	}
 	
-	pageContent := string(bodyBytes)
+	if content == "" {
+		return nil, currencyCode, fmt.Errorf("Пустой ответ")
+	}
 	
-	fmt.Printf("[Google] %s\n", countryCode)
+	log.Printf("[Google] %s", countryCode)
 	
 	// Проверяем наличие ошибки 404
-	if strings.Contains(pageContent, "We're sorry, the requested URL was not found on this server.") {
+	if strings.Contains(content, "We're sorry, the requested URL was not found on this server.") {
 		return nil, currencyCode, fmt.Errorf("404")
 	}
 	
 	// Проверяем наличие покупок в приложении
-	if !strings.Contains(pageContent, "In-app purchases") {
+	if !strings.Contains(content, "In-app purchases") {
 		return nil, currencyCode, fmt.Errorf("На странице нет текста 'In-app purchases'")
 	}
 	
@@ -349,7 +560,7 @@ func getPricesForCountry(countryCode string, appID string) ([]string, string, er
 	
 	for _, pattern := range patterns {
 		re := regexp.MustCompile(pattern)
-		matches := re.FindAllStringSubmatch(pageContent, -1)
+		matches := re.FindAllStringSubmatch(content, -1)
 		
 		for _, match := range matches {
 			if len(match) > 1 && match[1] != "" {
@@ -370,7 +581,7 @@ func getPricesForCountry(countryCode string, appID string) ([]string, string, er
 	if len(prices) == 0 {
 		// Попробуем найти просто цены без "per item"
 		rePrice := regexp.MustCompile(`"(\$[\d,.]+ - \$[\d,.]+)"`)
-		matches := rePrice.FindAllStringSubmatch(pageContent, -1)
+		matches := rePrice.FindAllStringSubmatch(content, -1)
 		
 		for _, match := range matches {
 			if len(match) > 1 && match[1] != "" {
@@ -388,72 +599,103 @@ func getPricesForCountry(countryCode string, appID string) ([]string, string, er
 
 // Функция для получения цен для всех стран
 func fetchPricesGoogle(appID string, chatID int64, bot *tgbotapi.BotAPI) (string, error) {
+	// Проверяем кэш
+	cachedPath := getFromCache(appID, "google")
+	if cachedPath != "" {
+		msg := tgbotapi.NewMessage(chatID, "Возвращаем данные из кэша...")
+		bot.Send(msg)
+		return cachedPath, nil
+	}
+	
 	msg := tgbotapi.NewMessage(chatID, "Обработка для Google Play началась...")
-	_, err := bot.Send(msg)
+	progressMsg, err := bot.Send(msg)
 	if err != nil {
 		return "", fmt.Errorf("Ошибка отправки сообщения: %v", err)
 	}
 	
 	var priceData []PriceData
 	var mu sync.Mutex // Для безопасной записи в общий слайс
-	// var errorCount int32 = 0 // Счетчик ошибок
 	
 	// Используем errgroup для параллельной обработки
 	g, ctx := errgroup.WithContext(context.Background())
 	sem := make(chan struct{}, 5) // Ограничиваем количество параллельных запросов
 	
-	for _, countryCode := range countries {
-		countryCode := countryCode // Создаем локальную копию для горутины
+	// Общее количество стран и групп
+	totalCountries := len(countries)
+	batchSize := 5
+	totalBatches := (totalCountries + batchSize - 1) / batchSize
+	
+	for batchNum := 0; batchNum < totalBatches; batchNum++ {
+		// Обновляем сообщение о прогрессе
+		progressPercent := int(float64(batchNum) / float64(totalBatches) * 100)
+		progressText := fmt.Sprintf("Прогресс: %d%% (%d/%d групп стран)", progressPercent, batchNum, totalBatches)
 		
-		// Проверяем, не был ли контекст отменен
-		select {
-		case <-ctx.Done():
-			break
-		default:
-			sem <- struct{}{} // Занимаем слот
-			g.Go(func() error {
-				defer func() { <-sem }() // Освобождаем слот
-				
-				// Устанавливаем обработчик паники
-				defer func() {
-					if r := recover(); r != nil {
-						log.Printf("[Google] %s: Восстановление после паники: %v", countryCode, r)
-					}
-				}()
-				
-				prices, currencyCode, err := getPricesForCountry(countryCode, appID)
-				if err != nil {
-					log.Printf("[Google] %s: %v", countryCode, err)
-					return nil // Не прерываем выполнение всей группы из-за ошибки одной страны
-				}
-				
-				if len(prices) > 0 {
-					minPriceUSD, maxPriceUSD, err := convertPriceToUSD(prices[0], currencyCode)
+		progressEdit := tgbotapi.NewEditMessageText(chatID, progressMsg.MessageID, progressText)
+		bot.Send(progressEdit)
+		
+		// Обрабатываем страны в текущей группе
+		start := batchNum * batchSize
+		end := start + batchSize
+		if end > totalCountries {
+			end = totalCountries
+		}
+		
+		for i := start; i < end; i++ {
+			countryCode := countries[i]
+			
+			// Проверяем, не был ли контекст отменен
+			select {
+			case <-ctx.Done():
+				break
+			default:
+				sem <- struct{}{} // Занимаем слот
+				g.Go(func() error {
+					defer func() { <-sem }() // Освобождаем слот
+					
+					// Устанавливаем обработчик паники
+					defer func() {
+						if r := recover(); r != nil {
+							log.Printf("[Google] %s: Восстановление после паники: %v", countryCode, r)
+						}
+					}()
+					
+					prices, currencyCode, err := getPricesForCountry(countryCode, appID)
 					if err != nil {
-						log.Printf("Ошибка при конвертации цены для %s: %v", countryCode, err)
-						return nil
+						log.Printf("[Google] %s: %v", countryCode, err)
+						return nil // Не прерываем выполнение всей группы из-за ошибки одной страны
 					}
 					
-					mu.Lock()
-					priceData = append(priceData, PriceData{
-						MinPriceUSD:   minPriceUSD,
-						MaxPriceUSD:   maxPriceUSD,
-						CountryCode:   countryCode,
-						CurrencyCode:  currencyCode,
-						OriginalPrice: prices[0],
-					})
-					mu.Unlock()
-				}
-				
-				return nil
-			})
+					if len(prices) > 0 {
+						minPriceUSD, maxPriceUSD, err := convertPriceToUSD(prices[0], currencyCode)
+						if err != nil {
+							log.Printf("Ошибка при конвертации цены для %s: %v", countryCode, err)
+							return nil
+						}
+						
+						mu.Lock()
+						priceData = append(priceData, PriceData{
+							MinPriceUSD:   minPriceUSD,
+							MaxPriceUSD:   maxPriceUSD,
+							CountryCode:   countryCode,
+							CurrencyCode:  currencyCode,
+							OriginalPrice: prices[0],
+						})
+						mu.Unlock()
+					}
+					
+					return nil
+				})
+			}
 		}
-	}
-	
-	// Ждем завершения всех горутин
-	if err := g.Wait(); err != nil {
-		log.Printf("Предупреждение: возникла ошибка в одной из горутин: %v", err)
-		// Продолжаем выполнение с теми данными, которые удалось получить
+		
+		// Ждем завершения всех горутин в текущей группе
+		if err := g.Wait(); err != nil {
+			log.Printf("Предупреждение: возникла ошибка в одной из горутин: %v", err)
+			// Продолжаем выполнение с теми данными, которые удалось получить
+		}
+		
+		// Сбрасываем группу для следующей партии
+		g, ctx = errgroup.WithContext(context.Background())
 	}
 	
 	// Проверяем, есть ли данные
@@ -461,10 +703,10 @@ func fetchPricesGoogle(appID string, chatID int64, bot *tgbotapi.BotAPI) (string
 		return "", fmt.Errorf("Не удалось получить данные о ценах ни для одной страны")
 	}
 	
-	// Отправляем сообщение о статусе обработки
-	statusMsg := fmt.Sprintf("Обработка завершена. Получена информация о ценах для %d из %d стран.", 
-		len(priceData), len(countries))
-	bot.Send(tgbotapi.NewMessage(chatID, statusMsg))
+	// Обновляем сообщение о статусе обработки
+	statusMsg := fmt.Sprintf("Обработка завершена. Получена информация о ценах для %d из %d стран.", len(priceData), len(countries))
+	finalEdit := tgbotapi.NewEditMessageText(chatID, progressMsg.MessageID, statusMsg)
+	bot.Send(finalEdit)
 	
 	// Сортируем данные по минимальной цене
 	sort.Slice(priceData, func(i, j int) bool {
@@ -479,8 +721,11 @@ func fetchPricesGoogle(appID string, chatID int64, bot *tgbotapi.BotAPI) (string
 		}
 	}
 	
+	// Создаем уникальное имя файла с временной меткой
+	timestamp := time.Now().Format("20060102_150405")
+	filepath := filepath.Join(CONST_PATH, fmt.Sprintf("%s_google_%s.csv", appID, timestamp))
+	
 	// Создаем CSV-файл
-	filepath := filepath.Join(CONST_PATH, fmt.Sprintf("%s_google.csv", appID))
 	file, err := os.Create(filepath)
 	if err != nil {
 		return "", fmt.Errorf("Ошибка создания файла: %v", err)
@@ -512,14 +757,76 @@ func fetchPricesGoogle(appID string, chatID int64, bot *tgbotapi.BotAPI) (string
 		}
 	}
 	
+	// Сохраняем в кэш
+	saveToCache(appID, "google", filepath)
+	
 	return filepath, nil
+}
+
+// Функция валидации URL-адреса приложения
+func validateAppURL(url string) (string, string) {
+	if strings.Contains(url, "play.google.com") {
+		re := regexp.MustCompile(`id=([\w\d\.]+)`)
+		matches := re.FindStringSubmatch(url)
+		if len(matches) >= 2 {
+			return "google", matches[1]
+		}
+	}
+	return "", ""
 }
 
 // Функция обработки команды start
 func handleStart(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
 	msg := tgbotapi.NewMessage(update.Message.Chat.ID, 
-		"Привет! Отправьте ссылку на приложение из Google Play "+
-		"(формата https://play.google.com/store/apps/details?id=xxx).")
+		"👋 Привет! Я бот для анализа цен приложений.\n\n"+
+		"Отправьте мне ссылку на приложение из:\n"+
+		"• Google Play (https://play.google.com/store/apps/details?id=xxx)\n\n"+
+		"Я проанализирую цены в разных странах и пришлю вам отчет в CSV формате.")
+	bot.Send(msg)
+}
+
+// Функция обработки команды help
+func handleHelp(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+		"📚 Справка по использованию бота:\n\n"+
+		"1️⃣ Отправьте ссылку на приложение из Google Play\n"+
+		"2️⃣ Дождитесь обработки (это может занять несколько минут)\n"+
+		"3️⃣ Получите CSV-файл с анализом цен\n\n"+
+		"Примеры ссылок:\n"+
+		"• https://play.google.com/store/apps/details?id=com.example.app\n\n"+
+		"Для повторного запуска бота используйте команду /start")
+	bot.Send(msg)
+}
+
+// Функция обработки команды status
+func handleStatus(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
+	cacheSize := 0
+	cacheMutex.RLock()
+	cacheSize = len(priceCache)
+	cacheMutex.RUnlock()
+	
+	// userID := update.Message.From.ID
+	
+	// Получаем информацию о лимите запросов пользователя
+	recentRequests := 0
+	userRequestsMu.Lock()
+	if data, exists := userRequests[update.Message.Chat.ID]; exists {
+		data.mu.Lock()
+		now := time.Now()
+		for _, t := range data.RequestTimes {
+			if now.Sub(t) < time.Minute {
+				recentRequests++
+			}
+		}
+		data.mu.Unlock()
+	}
+	userRequestsMu.Unlock()
+	
+	msg := tgbotapi.NewMessage(update.Message.Chat.ID,
+		"📊 Статус системы:\n\n"+
+		fmt.Sprintf("• Размер кэша: %d записей\n", cacheSize)+
+		fmt.Sprintf("• Ваши запросы: %d/5 за последнюю минуту\n", recentRequests)+
+		fmt.Sprintf("• Время сервера: %s", time.Now().Format("2006-01-02 15:04:05")))
 	bot.Send(msg)
 }
 
@@ -535,49 +842,59 @@ func handleMessage(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
 	if username == "" {
 		username = "неизвестный"
 	}
+	// userID := user.ID
 	fullName := user.FirstName
 	if user.LastName != "" {
 		fullName += " " + user.LastName
 	}
 	
-	// Проверяем, содержит ли сообщение ссылку на Google Play
-	if strings.Contains(text, "play.google.com") {
-		re := regexp.MustCompile(`id=([\w\d\.]+)`)
-		matches := re.FindStringSubmatch(text)
-		
-		if len(matches) < 2 {
-			msg := tgbotapi.NewMessage(chatID, "Не удалось найти идентификатор приложения в Google Play ссылке.")
-			bot.Send(msg)
-			return
-		}
-		
-		appID := matches[1]
-		filepath, err := fetchPricesGoogle(appID, chatID, bot)
-		
+	// Проверяем ограничение скорости пользователя
+	if !checkUserRateLimit(chatID, 5, 60) {
+		msg := tgbotapi.NewMessage(chatID, "⏳ Вы превысили лимит запросов. Попробуйте снова через минуту.")
+		bot.Send(msg)
+		return
+	}
+	
+	// Валидация ссылки
+	storeType, appID := validateAppURL(text)
+	if appID == "" {
+		msg := tgbotapi.NewMessage(chatID, "❌ Неверная ссылка. Пожалуйста, отправьте ссылку на приложение из Google Play.")
+		bot.Send(msg)
+		return
+	}
+	
+	// Обработка ссылки
+	var filePath string
+	var err error
+	
+	if storeType == "google" {
+		filePath, err = fetchPricesGoogle(appID, chatID, bot)
 		if err != nil {
 			log.Printf("Ошибка при получении цен для %s: %v", appID, err)
 			msg := tgbotapi.NewMessage(chatID, 
-				fmt.Sprintf("Произошла ошибка при получении информации о ценах для %s: %v", appID, err))
+				fmt.Sprintf("❌ Произошла ошибка при получении информации о ценах: %v", err))
 			bot.Send(msg)
 			return
 		}
-		
-		if filepath != "" {
-			file := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filepath))
-			_, err := bot.Send(file)
-			if err != nil {
-				log.Printf("Ошибка при отправке файла: %v", err)
-				msg := tgbotapi.NewMessage(chatID, "Произошла ошибка при отправке файла.")
-				bot.Send(msg)
-			}
-		} else {
-			msg := tgbotapi.NewMessage(chatID, 
-				fmt.Sprintf("Информация о ценах для приложения %s не найдена или страница недоступна.", appID))
+	} else {
+		msg := tgbotapi.NewMessage(chatID, "❌ Неподдерживаемый тип магазина. В настоящее время поддерживается только Google Play.")
+		bot.Send(msg)
+		return
+	}
+	
+	// Проверяем наличие файла
+	if filePath != "" && fileExists(filePath) {
+		file := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
+		file.Caption = "📄 Ваш отчет готов!"
+		_, err := bot.Send(file)
+		if err != nil {
+			log.Printf("Ошибка при отправке файла: %v", err)
+			msg := tgbotapi.NewMessage(chatID, "❌ Произошла ошибка при отправке файла.")
 			bot.Send(msg)
 		}
 	} else {
 		msg := tgbotapi.NewMessage(chatID, 
-			"Ссылка не распознана. Отправьте ссылку на приложение Google Play.")
+			fmt.Sprintf("❌ Информация о ценах для приложения %s не найдена или страница недоступна.", appID))
 		bot.Send(msg)
 	}
 	
@@ -588,7 +905,7 @@ func handleMessage(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
 	log.Printf("Запрос от %s (@%s)", fullName, username)
 	
 	// Записываем в файл логов
-	logsPath := filepath.Join(CONST_PATH, "logs.log")
+	logsPath := filepath.Join(CONST_PATH, "logs.log") // Исправлено: используем пакет filepath
 	file, err := os.OpenFile(logsPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		log.Printf("Ошибка при открытии файла логов: %v", err)
@@ -602,14 +919,41 @@ func handleMessage(update tgbotapi.Update, bot *tgbotapi.BotAPI) {
 	currentTime := time.Now().Format("2006-01-02 15:04:05")
 	err = writer.Write([]string{
 		currentTime,
-		fmt.Sprintf("Время: %.2f сек, пользователь: %s (@%s)", totalTime, fullName, username),
+		fmt.Sprintf("Время: %.2f сек, пользователь: %s (@%s), appID: %s", totalTime, fullName, username, appID),
 	})
 	if err != nil {
 		log.Printf("Ошибка при записи логов: %v", err)
 	}
 }
 
+// Инициализация и настройка системы логирования
+func initLogging() {
+	// Создаем директорию для логов, если не существует
+	if _, err := os.Stat(CONST_PATH); os.IsNotExist(err) {
+		os.MkdirAll(CONST_PATH, 0755)
+	}
+	
+	// Открываем файл логов
+	logFile, err := os.OpenFile(
+		filepath.Join(CONST_PATH, "app.log"),
+		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
+		0644,
+	)
+	if err != nil {
+		log.Fatalf("Не удалось открыть файл логов: %v", err)
+	}
+	
+	// Настраиваем вывод логов в файл и в консоль
+	log.SetOutput(io.MultiWriter(logFile, os.Stdout))
+	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+	
+	log.Println("Логирование инициализировано")
+}
+
 func main() {
+	// Инициализируем логирование
+	initLogging()
+	
 	// Создаем директорию для данных, если не существует
 	if _, err := os.Stat(CONST_PATH); os.IsNotExist(err) {
 		os.MkdirAll(CONST_PATH, 0755)
@@ -635,8 +979,16 @@ func main() {
 			continue
 		}
 		
-		if update.Message.IsCommand() && update.Message.Command() == "start" {
-			go handleStart(update, bot)
+		if update.Message.IsCommand() {
+			// Обрабатываем команды
+			switch update.Message.Command() {
+			case "start":
+				go handleStart(update, bot)
+			case "help":
+				go handleHelp(update, bot)
+			case "status":
+				go handleStatus(update, bot)
+			}
 		} else if update.Message.Text != "" {
 			go handleMessage(update, bot)
 		}
