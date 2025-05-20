@@ -24,7 +24,7 @@ import (
 
 // Конфигурация
 const (
-	CONST_TOKEN        = "6993196254:AAG6Za3SDay3hNSrvneCGFlmg8vRn9W2PYs"              // <-- ВСТАВЬТЕ СЮДА СВОЙ ТОКЕН!
+	CONST_TOKEN        = ""              // <-- ВСТАВЬТЕ СЮДА СВОЙ ТОКЕН!
 	CONST_PATH         = "./data"             // Путь для сохранения файлов
 	CACHE_EXPIRY_HOURS = 24                   // Срок действия кэша в часах
 	RATES_PATH         = "./data/usd_rates.json"
